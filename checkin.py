@@ -321,30 +321,129 @@ def execute_login_check_in(client, account_name: str, provider_config, email: st
 	return False, None
 
 
-async def login_check_in_flow(account: AccountConfig, account_name: str, provider_config):
-	"""登录式签到流程：登录触发签到 → 读取余额（agentrouter）"""
-	waf_cookies = {}
-	if provider_config.needs_waf_cookies():
-		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		# 传 None 抓取浏览器全部 cookie；并额外访问被 WAF 拦的 /api 路径以触发并解出 acw_sc__v2
-		probe = [f'{provider_config.domain}{provider_config.user_info_path}']
-		waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, None, probe_urls=probe)
-		if not waf_cookies:
-			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
-			return False, None, None
+async def browser_login_check_in(account: AccountConfig, account_name: str, provider_config):
+	"""全程在浏览器内完成登录式签到（应对 agentrouter 的阿里云反自动化 WAF aliyun_waf_aa）。
 
+	先在浏览器里过 WAF 挑战，再用同一浏览器上下文（指纹 + cookie 一致）发起登录与查询，
+	避免把指纹绑定的挑战 cookie 拿到 httpx 重放被拒。
+	"""
+	print(f'[PROCESSING] {account_name}: Browser-native login check-in (anti-bot WAF)...')
+	domain = provider_config.domain
+	async with async_playwright() as p:
+		import tempfile
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--disable-web-security',
+					'--disable-features=VizDisplayCompositor',
+					'--no-sandbox',
+				],
+			)
+			page = await context.new_page()
+			try:
+				await page.goto(f'{domain}{provider_config.login_path}', wait_until='networkidle')
+				try:
+					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+				except Exception:
+					await page.wait_for_timeout(2000)
+
+				# 访问 /api 路径触发 WAF 挑战，让浏览器有机会解出；若仍是挑战页则等待重载
+				probe_url = f'{domain}{provider_config.user_info_path}'
+				try:
+					resp = await page.goto(probe_url, wait_until='networkidle')
+					ptxt = (await resp.text()) if resp else ''
+					print(f'[INFO] {account_name}: probe /self status={resp.status if resp else "?"} body={ptxt[:80]!r}')
+					if 'aliyun_waf' in ptxt.lower() or '<!doctype' in ptxt.lower() or '<html' in ptxt.lower():
+						await page.wait_for_timeout(4000)
+						resp = await page.goto(probe_url, wait_until='networkidle')
+						ptxt = (await resp.text()) if resp else ''
+						print(f'[INFO] {account_name}: probe retry status={resp.status if resp else "?"} body={ptxt[:80]!r}')
+				except Exception as e:
+					print(f'[INFO] {account_name}: probe nav error {str(e)[:40]}')
+
+				# 浏览器内发起登录（同源 fetch，带浏览器指纹与全部 cookie）
+				res = await page.evaluate(
+					"""async (a) => {
+						try {
+							const r = await fetch(a.path, {method:'POST', headers:{'Content-Type':'application/json'},
+								body: JSON.stringify({username:a.email, password:a.pwd}), credentials:'include'});
+							return {status:r.status, body: await r.text()};
+						} catch (e) { return {status:-1, body:String(e)}; }
+					}""",
+					{'path': provider_config.login_api_path, 'email': account.email, 'pwd': account.password},
+				)
+				print(f'[RESPONSE] {account_name}: in-browser login status {res.get("status")}')
+				try:
+					result = json.loads(res.get('body') or '')
+				except Exception:
+					snip = (res.get('body') or '')[:120].replace('\n', ' ')
+					print(f'[FAILED] {account_name}: in-browser login non-JSON (WAF): {snip}')
+					return False, None, None
+
+				if not result.get('success'):
+					print(f'[FAILED] {account_name}: login - {result.get("message") or result.get("msg")}')
+					return False, None, None
+
+				data = result.get('data') or {}
+				uid = data.get('id')
+				print(f'[SUCCESS] {account_name}: Login OK (id={uid}, checked_in={data.get("checked_in")}) - check-in triggered')
+
+				# 浏览器内读取余额
+				info = await page.evaluate(
+					"""async (a) => {
+						try {
+							const r = await fetch(a.path, {headers:a.headers, credentials:'include'});
+							return {status:r.status, body: await r.text()};
+						} catch (e) { return {status:-1, body:String(e)}; }
+					}""",
+					{'path': provider_config.user_info_path, 'headers': {provider_config.api_user_key: str(uid)}},
+				)
+				user_info = {'success': False, 'error': 'balance unavailable'}
+				try:
+					j = json.loads(info.get('body') or '')
+					if j.get('success'):
+						ud = j.get('data', {})
+						quota = round(ud.get('quota', 0) / 500000, 2)
+						used = round(ud.get('used_quota', 0) / 500000, 2)
+						user_info = {
+							'success': True,
+							'quota': quota,
+							'used_quota': used,
+							'display': f':money: Current balance: ${quota}, Used: ${used}',
+						}
+						print(user_info['display'])
+				except Exception:
+					pass
+				return True, user_info, user_info
+			except Exception as e:
+				print(f'[FAILED] {account_name}: browser login error - {str(e)[:60]}')
+				return False, None, None
+			finally:
+				await context.close()
+
+
+async def login_check_in_flow(account: AccountConfig, account_name: str, provider_config):
+	"""登录式签到流程。"""
+	# 有反自动化 WAF 的 provider（agentrouter）：全程浏览器内完成，规避指纹绑定挑战
+	if provider_config.needs_waf_cookies():
+		return await browser_login_check_in(account, account_name, provider_config)
+
+	# 无 WAF（住宅 IP / 本机）：httpx 直接登录
 	client = httpx.Client(http2=True, timeout=30.0)
 	try:
-		if waf_cookies:
-			client.cookies.update(waf_cookies)
-
 		success, user_data = execute_login_check_in(
 			client, account_name, provider_config, account.email, account.password
 		)
 		if not success:
 			return False, None, None
 
-		# 登录响应已带回 session cookie；用响应中的 id 作为 new-api-user 读取余额
 		api_user = str((user_data or {}).get('id') or account.api_user or '')
 		headers = {
 			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
@@ -363,7 +462,6 @@ async def login_check_in_flow(account: AccountConfig, account_name: str, provide
 		elif user_info:
 			print(user_info.get('error', 'Unknown error'))
 
-		# 登录即已签到，签到前后视为同一状态
 		return True, user_info, user_info
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error during login check-in - {str(e)[:60]}')
