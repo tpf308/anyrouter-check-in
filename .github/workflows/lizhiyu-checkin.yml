@@ -1,0 +1,33 @@
+name: Lizhiyu 自动签到
+
+on:
+  schedule:
+    # 每天 UTC 1:17（北京时间 9:17）跑一次；错峰避开整点
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install "httpx[http2]"
+
+      - name: 执行签到
+        env:
+          LIZHIYU_ACCOUNTS: ${{ secrets.LIZHIYU_ACCOUNTS }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          CUSTOM_SMTP_SERVER: ${{ secrets.CUSTOM_SMTP_SERVER }}
+          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+        run: python lizhiyu_checkin.py
