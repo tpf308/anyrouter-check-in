@@ -50,13 +50,13 @@ def load_accounts() -> dict[str, list[dict[str, Any]]]:
     if not isinstance(data, dict):
         raise RuntimeError("API_SITES_ACCOUNTS must be a JSON object.")
     result: dict[str, list[dict[str, Any]]] = {}
-    for site in ("ranmeng", "aiapi1"):
+    for site in ("ranmeng",):
         items = data.get(site, []) or []
         if not isinstance(items, list):
             raise RuntimeError(f"{site} must be a JSON array.")
         result[site] = items
-    if not result["ranmeng"] and not result["aiapi1"]:
-        raise RuntimeError("No accounts found under ranmeng or aiapi1.")
+    if not result["ranmeng"]:
+        raise RuntimeError("No accounts found under ranmeng.")
     return result
 
 
@@ -259,7 +259,7 @@ def main() -> int:
     total_count = 0
     with LOG_FILE.open("a", encoding="utf-8") as handle:
         log(handle, "===== API sites check-in start =====")
-        for site in ("ranmeng", "aiapi1"):
+        for site in ("ranmeng",):
             ok, count = run_site(handle, site, accounts[site])
             total_ok += ok
             total_count += count
